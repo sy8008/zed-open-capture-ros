@@ -18,13 +18,20 @@ include_directories(
     /usr/include/hidapi
     )
 
+
 catkin_package(
     LIBRARIES 
     CATKIN_DEPENDS
 )
-
+find_package(Eigen3 REQUIRED)
+find_package(OpenCV REQUIRED)
+include_directories($(OpenCV_INCLUDE_DIRS))
+include_directories(${EIGEN3_INCLUDE_DIR})
+ 
 add_executable(${PROJECT_NAME} src/zed_node.cpp)
 target_link_libraries(${PROJECT_NAME}
     ${catkin_LIBRARIES}
     /usr/local/lib/libzed_open_capture.so
+    ${OpenCV_LIBRARIES}
+    Eigen3::Eigen
     )
