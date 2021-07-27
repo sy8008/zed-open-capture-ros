@@ -8,10 +8,13 @@
 #include <ros/ros.h>
 #include <sensor_msgs/Image.h>
 #include <sensor_msgs/Imu.h>
+#include<sensor_msgs/MagneticField.h>
 #include<Eigen/Core>
 #include<Eigen/Dense>
 #include "nav_msgs/Odometry.h"
 #include "geometry_msgs/AccelWithCovarianceStamped.h"
+#include "geometry_msgs/Pose.h"
+
 
 #include <message_filters/subscriber.h>
 #include <message_filters/synchronizer.h>
@@ -23,8 +26,15 @@
 #include <zed-open-capture/sensorcapture.hpp>
 #include <zed-open-capture/videocapture.hpp>
 
+
 using namespace std;
-using namespace message_filters;
+// using namespace message_filters;
+
+bool is_first_time_enter=false;
+double last_imu_time=0.0, curr_imu_time=0.0;
+double last_mag_time=0.0, curr_mag_time=0.0;
+
+
 
 class StereoCamera
 {
@@ -36,6 +46,10 @@ public:
         params.res = resolution;
         params.fps = fps;
         params.verbose = verbose;
+
+        // Eigen::Matrix3d rot = (Eigen::Matrix3d()<<0 , -1 , 0, 1 ,0 ,0, 0 , 0, 1).finished();
+        // Eigen::Quaterniond q_rot(rot);
+        // cout << "q: "<< q_rot.coeffs() << endl;
 
         // Create a Video Capture object
         auto camera_ = new sl_oc::video::VideoCapture(params);
@@ -74,19 +88,33 @@ public:
     }
 
     // Sensor acquisition runs at 400Hz, so it must be executed in a different thread
-    const sl_oc::sensors::data::Imu getLastIMUData()
+    const sl_oc::sensors::data::Magnetometer getLastMagnetometerData( uint64_t  timeout_usec = 100)
     {
-        return sensor->getLastIMUData();
+        return sensor->getLastMagnetometerData( timeout_usec );
     }
 
-    const sl_oc::video::Frame getLastFrame()
+    const sl_oc::video::Frame getLastFrame(uint64_t  	timeout_msec = 1)
     {
-        return camera->getLastFrame(1);
+        return camera->getLastFrame(timeout_msec);
     }
+
+    const sl_oc::sensors::data::Imu getLastIMUData( uint64_t  	timeout_usec = 1500 )
+    {
+        return sensor->getLastIMUData(timeout_usec);
+    }
+
 
     sl_oc::video::VideoCapture *camera;
     sl_oc::sensors::SensorCapture *sensor;
 };
+
+
+const double deg_to_degree_factor=0.0174533;
+const double uT_to_gauss_factor = 0.01; // unit translation
+const double radian_to_degree_factor=57.2957795;
+const double uT_to_T_factor= 1e-6; 
+
+
 
 image_transport::Publisher left_image_pub;
 image_transport::Publisher right_image_pub;
@@ -100,12 +128,16 @@ sensor_msgs::Imu filtered_imu_msg;
 
 
 ros::Publisher sensor_pub;
+ros::Publisher enu_pose_pub;
+ros::Publisher mag_raw_pub;
+
+
 sl_oc::video::RESOLUTION gResolution;
 sl_oc::video::FPS gFps;
 StereoCamera *zed;
-Eigen::Vector3d tmp_acc, tmp_gyr, rect_acc, rect_gyr;  
+Eigen::Vector3d tmp_acc, tmp_gyr, rect_acc, rect_gyr,rect_mag;  
 
-Eigen::Matrix3d acc_miss_align = Eigen::Matrix3d::Identity();
+Eigen::Matrix3d acc_miss_align = Eigen::Matrix3d::Identity();   
 
     
 Eigen::Matrix3d acc_scale = Eigen::Matrix3d::Identity();
@@ -114,7 +146,7 @@ Eigen::Vector3d acc_bias(0.029,0.282,-0.002);
 
 Eigen::Vector3d acc_bias_after_rect(-0.393,0.056,0.00);
 
-const double deg_to_degree_factor=0.0174533;
+
 
 vector<double> mean_rect_acc2,mean_rect_acc1,mean_rect_acc0;
 
@@ -202,7 +234,57 @@ void image_callback(const ros::TimerEvent &timer_event)
 void sensor_callback(const ros::TimerEvent &timer_event)
 {
     const sl_oc::sensors::data::Imu imuData = zed->getLastIMUData();
-    if (imuData.valid == sl_oc::sensors::data::Imu::NEW_VAL) // Uncomment to use only data syncronized with the video frames
+    // const sl_oc::sensors::data::Magnetometer magData = zed->getLastMagnetometerData(100);
+    // const sl_oc::sensors::data::Magnetometer magData= sl_oc::sensors::data::Magnetometer();
+
+    // if (magData.valid == sl_oc::sensors::data::Magnetometer::NEW_VAL){
+    //     // cout<< "get mag data!" <<endl;
+    //     ros::Time mag_time_stamp=ros::Time(magData.timestamp * 1e-9);
+    //     curr_mag_time = mag_time_stamp.toSec();
+    //     cout.setf(ios::fixed, ios::floatfield);
+    //     cout<<"mag data hz: " <<  1.0 / (curr_mag_time-last_mag_time)<<endl;
+    //     last_mag_time=mag_time_stamp.toSec();
+
+    // }
+
+    // if (imuData.valid == sl_oc::sensors::data::Imu::NEW_VAL){
+    //     // cout<< "get mag data!" <<endl;
+    //     ros::Time imu_time_stamp=ros::Time(magData.timestamp * 1e-9);
+    //     curr_imu_time=imu_time_stamp.toSec();
+    //     cout.setf(ios::fixed, ios::floatfield);
+    //     cout<< "mag imu diff: " << (curr_imu_time - curr_mag_time) <<endl;
+
+    // }
+
+        const sl_oc::sensors::data::Magnetometer magData= zed->getLastMagnetometerData(100);
+        if (magData.valid == sl_oc::sensors::data::Magnetometer::NEW_VAL){
+            ros::Time mag_time_stamp=ros::Time(magData.timestamp * 1e-9);
+            curr_mag_time = mag_time_stamp.toSec();
+            rect_mag<< - magData.mZ, - magData.mY, - magData.mX;
+            rect_mag = rect_mag * uT_to_T_factor; // convert unit
+
+            sensor_msgs::MagneticField mag_msg;
+            mag_msg.header.stamp = mag_time_stamp;
+            mag_msg.header.frame_id= "sensor";
+            mag_msg.magnetic_field.x = rect_mag[0];
+            mag_msg.magnetic_field.y = rect_mag[1];
+            mag_msg.magnetic_field.z = rect_mag[2];
+            mag_raw_pub.publish(mag_msg);
+
+
+
+
+            double dt= curr_mag_time - last_mag_time ;
+            // cout << "rect mag : " << rect_mag << endl;
+            // cout << "mag frequency: " << 1.0 / dt << endl;
+
+            
+
+            // cout << "My attitude is (ZYX Euler): (" << Est.eulerYaw() << "," << Est.eulerPitch() << "," << Est.eulerRoll() << ")" << endl;
+            last_mag_time=curr_mag_time;
+        }
+
+    if (imuData.valid == sl_oc::sensors::data::Imu::NEW_VAL ) // Uncomment to use only data syncronized with the video frames
     {
         sensor_msgs::Imu imu;
         imu.header.stamp = ros::Time(imuData.timestamp * 1e-9);
@@ -210,116 +292,161 @@ void sensor_callback(const ros::TimerEvent &timer_event)
         
         imu_time=imu_ros_time.toSec();
 
-        // cout.setf(ios::fixed,ios::floatfield);
-        // cout<< "imu time: "<<  imu_time << endl;
+     
+            cout.setf(ios::fixed, ios::floatfield);
+            // cout<< "mag imu diff: " << (curr_imu_time - curr_mag_time) <<endl;
+            // cout << "imu hz : " <<  1.0 / (imu_time - last_imu_time) << endl ; 
 
-        imu.header.frame_id = "world";
-        // imu.angular_velocity.x = imuData.gX;
-        // imu.angular_velocity.y = imuData.gY;
-        // imu.angular_velocity.z = imuData.gZ;
-        tmp_gyr<<-imuData.gZ, -imuData.gY, -imuData.gX;
-        tmp_gyr*=deg_to_degree_factor;
+            last_imu_time=imu_time;
 
-        rect_gyr=gyr_TK*(tmp_gyr-gyr_bias);
-        // rect_gyr=tmp_gyr; // do not do rectification, use raw measurement
+            // cout.setf(ios::fixed,ios::floatfield);
+            // cout<< "imu time: "<<  imu_time << endl;
 
-        // imu.angular_velocity.x = rect_gyr[0];
-        // imu.angular_velocity.y = rect_gyr[1];
-        // imu.angular_velocity.z = rect_gyr[2];
+            imu.header.frame_id = "sensor";
+            // imu.angular_velocity.x = imuData.gX;
+            // imu.angular_velocity.y = imuData.gY;
+            // imu.angular_velocity.z = imuData.gZ;
+            tmp_gyr<<-imuData.gZ, -imuData.gY, -imuData.gX;
+            tmp_gyr*=deg_to_degree_factor;
 
-        // imu.angular_velocity.x = -rect_gyr[2];
-        // imu.angular_velocity.y = -rect_gyr[1];
-        // imu.angular_velocity.z = -rect_gyr[0];
+            rect_gyr=gyr_TK*(tmp_gyr-gyr_bias);
+            // rect_gyr=tmp_gyr; // do not do rectification, use raw measurement
 
-        imu.angular_velocity.x = rect_gyr[0];
-        imu.angular_velocity.y = rect_gyr[1];
-        imu.angular_velocity.z = rect_gyr[2];
+            // imu.angular_velocity.x = rect_gyr[0];
+            // imu.angular_velocity.y = rect_gyr[1];
+            // imu.angular_velocity.z = rect_gyr[2];
 
-        // cout<<"raw gyr0: "<<imuData.gX<<" rect gyr0: "<<rect_gyr[0]<<endl;
-        // cout<<"raw gyr1: "<<imuData.gY<<" rect gyr1: "<<rect_gyr[1]<<endl;
-        // cout<<"raw gyr2: "<<imuData.gZ<<" rect gyr2: "<<rect_gyr[2]<<endl;
+            // imu.angular_velocity.x = -rect_gyr[2];
+            // imu.angular_velocity.y = -rect_gyr[1];
+            // imu.angular_velocity.z = -rect_gyr[0];
+
+            imu.angular_velocity.x = rect_gyr[0];
+            imu.angular_velocity.y = rect_gyr[1];
+            imu.angular_velocity.z = rect_gyr[2];
+
+            // cout<<"raw gyr0: "<<imuData.gX<<" rect gyr0: "<<rect_gyr[0]<<endl;
+            // cout<<"raw gyr1: "<<imuData.gY<<" rect gyr1: "<<rect_gyr[1]<<endl;
+            // cout<<"raw gyr2: "<<imuData.gZ<<" rect gyr2: "<<rect_gyr[2]<<endl;
 
 
-        
- 
-        // imu.linear_acceleration.x = imuData.aX;
-        // imu.linear_acceleration.y = imuData.aY;
-        // imu.linear_acceleration.z = imuData.aZ;
-        //  tmp_acc<<imuData.aX, imuData.aY, imuData.aZ;
+            
+    
+            // imu.linear_acceleration.x = imuData.aX;
+            // imu.linear_acceleration.y = imuData.aY;
+            // imu.linear_acceleration.z = imuData.aZ;
+            //  tmp_acc<<imuData.aX, imuData.aY, imuData.aZ;
 
-        tmp_acc<<-imuData.aZ, -imuData.aY, -imuData.aX;
-        rect_acc=acc_TK*(tmp_acc-acc_bias);
-        // rect_acc=tmp_acc; // use orignal measurement 
+            tmp_acc<<-imuData.aZ, -imuData.aY, -imuData.aX;
+            rect_acc=acc_TK*(tmp_acc-acc_bias);
+            // rect_acc=tmp_acc; // use orignal measurement 
 
-        rect_acc-=acc_bias_after_rect;
-        // cout<<"raw acc0: "<<imuData.aX<<" rect acc0: "<<rect_acc[0]<<endl;
-        // cout<<"raw acc1: "<<imuData.aY<<" rect acc1: "<<rect_acc[1]<<endl;
-        // cout<<"raw acc2: "<<imuData.aZ<<" rect acc2: "<<rect_acc[2]<<endl;
+            rect_acc-=acc_bias_after_rect;
+            // cout<<"raw acc0: "<<imuData.aX<<" rect acc0: "<<rect_acc[0]<<endl;
+            // cout<<"raw acc1: "<<imuData.aY<<" rect acc1: "<<rect_acc[1]<<endl;
+            // cout<<"raw acc2: "<<imuData.aZ<<" rect acc2: "<<rect_acc[2]<<endl;
 
-        // imu.linear_acceleration.x = rect_acc[0];
-        // imu.linear_acceleration.y = rect_acc[1];
-        // imu.linear_acceleration.z = rect_acc[2];
-        
-        // if(cnt<4000){
-        //     mean_rect_acc2.push_back(rect_acc[2]);
-        //     mean_rect_acc1.push_back(rect_acc[1]);
-        //     mean_rect_acc0.push_back(rect_acc[0]);
-        //     cnt++;
-        // }
-        // else {
-          
-        //     double mean_acc2=accumulate(mean_rect_acc2.begin(),mean_rect_acc2.end(),0.0)*1.0/mean_rect_acc2.size();
-        //     double mean_acc1=accumulate(mean_rect_acc1.begin(),mean_rect_acc1.end(),0.0)*1.0/mean_rect_acc1.size();
-        //     double mean_acc0=accumulate(mean_rect_acc0.begin(),mean_rect_acc0.end(),0.0)*1.0/mean_rect_acc0.size();
-        //     cout<<"mean acc2: "<<mean_acc2<< " mean acc1: "<<mean_acc1<< "mean acc0: "<<mean_acc0<<endl;
-        //     cnt=0;
-        //     mean_rect_acc2.clear();
-        //     mean_rect_acc1.clear();
-        // }
+            // imu.linear_acceleration.x = rect_acc[0];
+            // imu.linear_acceleration.y = rect_acc[1];
+            // imu.linear_acceleration.z = rect_acc[2];
+            
+            // if(cnt<4000){
+            //     mean_rect_acc2.push_back(rect_acc[2]);
+            //     mean_rect_acc1.push_back(rect_acc[1]);
+            //     mean_rect_acc0.push_back(rect_acc[0]);
+            //     cnt++;
+            // }
+            // else {
+            
+            //     double mean_acc2=accumulate(mean_rect_acc2.begin(),mean_rect_acc2.end(),0.0)*1.0/mean_rect_acc2.size();
+            //     double mean_acc1=accumulate(mean_rect_acc1.begin(),mean_rect_acc1.end(),0.0)*1.0/mean_rect_acc1.size();
+            //     double mean_acc0=accumulate(mean_rect_acc0.begin(),mean_rect_acc0.end(),0.0)*1.0/mean_rect_acc0.size();
+            //     cout<<"mean acc2: "<<mean_acc2<< " mean acc1: "<<mean_acc1<< "mean acc0: "<<mean_acc0<<endl;
+            //     cnt=0;
+            //     mean_rect_acc2.clear();
+            //     mean_rect_acc1.clear();
+            // }
 
-        // imu.linear_acceleration.x = -rect_acc[2];
-        // imu.linear_acceleration.y = -rect_acc[1];
-        // imu.linear_acceleration.z =- rect_acc[0];
+            // imu.linear_acceleration.x = -rect_acc[2];
+            // imu.linear_acceleration.y = -rect_acc[1];
+            // imu.linear_acceleration.z =- rect_acc[0];
 
-        imu.linear_acceleration.x = rect_acc[0];
-        imu.linear_acceleration.y = rect_acc[1];
-        imu.linear_acceleration.z = rect_acc[2];
+            imu.linear_acceleration.x = rect_acc[0];
+            imu.linear_acceleration.y = rect_acc[1];
+            imu.linear_acceleration.z = rect_acc[2];
 
-        sensor_pub.publish(imu);
+            // rect_mag<< - magData.mZ, - magData.mY, - magData.mX;
+
+            // if (!is_first_time_enter){
+            //     is_first_time_enter=true;
+            //     last_imu_time=imu_time;
+            // }
+            // else {
+            //     double dt=imu_time-last_imu_time;
+            //     cout.setf(ios::fixed,ios::floatfield);
+            //     cout<<"dt: "<<setprecision(4)<<dt<<endl;
+            //     last_imu_time=imu_time;
+            //     Est.update(dt, rect_gyr[0], rect_gyr[1], rect_gyr[2], 
+            //                                     rect_acc[0], rect_acc[1], rect_acc[2],  
+            //                                 rect_mag[0], rect_mag[1], rect_mag[2]);
+            //     cout << "My attitude is (fused): (" << Est.fusedYaw() << "," << Est.fusedPitch() << "," << Est.fusedRoll()<<endl;
+
+            // }
+
+            sensor_pub.publish(imu);
     }
+    
 }
 
 
-void odom_acc_Callback(const nav_msgs::Odometry::ConstPtr& nav_msg,
-                                                     const geometry_msgs::AccelWithCovarianceStamped::ConstPtr& acc_msg){
-        filtered_imu_msg.header=nav_msg->header;
-        filtered_imu_msg.angular_velocity=nav_msg->twist.twist.angular;
-        filtered_imu_msg.linear_acceleration=acc_msg->accel.accel.linear;
-        float imu_angular_cov[9];
+// void pose_callback(const ros::TimerEvent &timer_event){
+//         const sl_oc::sensors::data::Magnetometer magData= zed->getLastMagnetometerData(1000);
+//         if (magData.valid == sl_oc::sensors::data::Magnetometer::NEW_VAL){
+//             ros::Time mag_time_stamp=ros::Time(magData.timestamp * 1e-9);
+//             curr_mag_time = mag_time_stamp.toSec();
+//             rect_mag<< - magData.mZ, - magData.mY, - magData.mX;
+//             rect_mag *= uT_to_gauss_factor; // convert unit
+
+//             double dt= curr_mag_time - last_mag_time ;
+//             // cout << "rect mag : " << rect_mag << endl;
+//             cout << "mag frequency: " << 1.0 / dt << endl;
+//             Est.update(dt, rect_gyr[0], rect_gyr[1], rect_gyr[2], 
+//                                                 rect_acc[0], rect_acc[1], rect_acc[2],  
+//                                             rect_mag[0], rect_mag[1], rect_mag[2]);
+//             // cout << "My attitude is (fused): (" << Est.fusedYaw() << "," << Est.fusedPitch() << "," << Est.fusedRoll()<<endl;
+//             cout << "My attitude is (ZYX Euler): (" << Est.eulerYaw() * radian_to_degree_factor << "," << Est.eulerPitch() *radian_to_degree_factor<< "," << Est.eulerRoll() * radian_to_degree_factor << ")" << endl;
+//             last_mag_time=curr_mag_time;
+//         }
+
+
+// }
+
+
+// void odom_acc_Callback(const nav_msgs::Odometry::ConstPtr& nav_msg,
+//                                                      const geometry_msgs::AccelWithCovarianceStamped::ConstPtr& acc_msg){
+//         filtered_imu_msg.header=nav_msg->header;
+//         filtered_imu_msg.angular_velocity=nav_msg->twist.twist.angular;
+//         filtered_imu_msg.linear_acceleration=acc_msg->accel.accel.linear;
+//         float imu_angular_cov[9];
     
 
-        int j=0;
-        for(int i=0;i<9; i ++){
-            j=21+ i + int(i/3)*3;
-            filtered_imu_msg.angular_velocity_covariance[i]=nav_msg->twist.covariance[j];
-            // cout<<"cov j1: "<<j <<endl;
-        }
+//         int j=0;
+//         for(int i=0;i<9; i ++){
+//             j=21+ i + int(i/3)*3;
+//             filtered_imu_msg.angular_velocity_covariance[i]=nav_msg->twist.covariance[j];
+//             // cout<<"cov j1: "<<j <<endl;
+//         }
         
 
-        j=0;
-        for(int i=0;i<9; i ++){
-            j=i + int(i/3)*3;
-            filtered_imu_msg.linear_acceleration_covariance[i]=acc_msg->accel.covariance[j];
-            // cout<<"cov j2: "<<j <<endl;
-        }
+//         j=0;
+//         for(int i=0;i<9; i ++){
+//             j=i + int(i/3)*3;
+//             filtered_imu_msg.linear_acceleration_covariance[i]=acc_msg->accel.covariance[j];
+//             // cout<<"cov j2: "<<j <<endl;
+//         }
         
-        imu_filtered_pub.publish(filtered_imu_msg);
+//         imu_filtered_pub.publish(filtered_imu_msg);
 
-        
-
-
-
-}
+// }
 
 void correctFramerate(int resolution)
 {
@@ -358,12 +485,16 @@ int main(int argc, char **argv)
     left_image_pub = it.advertise("left/image_raw", 30);
     right_image_pub = it.advertise("right/image_raw", 30);
     sensor_pub = nh.advertise<sensor_msgs::Imu>("imu/raw", 200);
-    imu_filtered_pub = nh.advertise<sensor_msgs::Imu>("imu/filtered", 200);
+    mag_raw_pub = nh.advertise<sensor_msgs::MagneticField>("mag/raw",50);
 
-    message_filters::Subscriber<nav_msgs::Odometry> odom_sub(nh, "/odometry/filtered", 100);
-    message_filters::Subscriber<geometry_msgs::AccelWithCovarianceStamped> acc_sub(nh, "/accel/filtered", 100);
+    // imu_filtered_pub = nh.advertise<sensor_msgs::Imu>("imu/filtered", 200);
 
-    typedef sync_policies::ApproximateTime<nav_msgs::Odometry, geometry_msgs::AccelWithCovarianceStamped> MySyncPolicy;
+//    enu_pose_pub = nh.advertise<geometry_msgs::Pose>("enu_pose", 50);
+
+    // message_filters::Subscriber<nav_msgs::Odometry> odom_sub(nh, "/odometry/filtered", 100);
+    // message_filters::Subscriber<geometry_msgs::AccelWithCovarianceStamped> acc_sub(nh, "/accel/filtered", 100);
+
+    // typedef sync_policies::ApproximateTime<nav_msgs::Odometry, geometry_msgs::AccelWithCovarianceStamped> MySyncPolicy;
   // ApproximateTime takes a queue size as its constructor argument, hence MySyncPolicy(10)
     // Synchronizer<MySyncPolicy> sync(MySyncPolicy(10), odom_sub, acc_sub);
     // sync.registerCallback(boost::bind(&odom_acc_Callback, _1, _2));
@@ -371,6 +502,8 @@ int main(int argc, char **argv)
 
     ros::Timer image_timer;
     ros::Timer sensor_timer;
+
+    // ros::Timer pose_timer;
     
     
     cout<<"acc_inv: "<<endl;
@@ -389,11 +522,12 @@ int main(int argc, char **argv)
     zed = new StereoCamera(gResolution, gFps);
     if (zed->camera)
     {
-        image_timer = nh.createTimer(ros::Duration(0.001), image_callback);
+        image_timer = nh.createTimer(ros::Duration(0.01), image_callback);
     }
     if (zed->sensor)
     {
         sensor_timer = nh.createTimer(ros::Duration(0.001), sensor_callback);
+        // pose_timer=nh.createTimer(ros::Duration(0.01), pose_callback);
     }
     if (!zed->camera && !zed->sensor)
     {

@@ -5,6 +5,8 @@
 <node pkg="zed-open-capture-ros" type="zed-open-capture-ros" name="zed_node" output="screen" ns="$(arg camera_namespace)" required="true">
 	<param name="resolution" value="$(arg resolution)" unless="$(eval resolution>3)"/>
 </node>
+
+<include file="$(find imu_complementary_filter)/launch/complementary_filter.launch"/>
  <!--include file="$(find robot_localization)/launch/ekf_imu.launch"/>-->
 
 </launch>
